@@ -1,4 +1,4 @@
-import type { Client, Guild } from "discord.js";
+import { ApplicationCommandType, type Client, type Guild } from "discord.js";
 import { logger } from "../logger.ts";
 import { commands } from "./index.ts";
 
@@ -20,12 +20,16 @@ export async function registerGuildCommands(guild: Guild) {
 
 /**
  * Removes stale global commands (so they don't show up twice) and overwrites
- * the commands in every guild the bot is in.
+ * the commands in every guild the bot is in. Deletes one by one instead of a
+ * bulk `set([])`: Discord rejects bulk updates that drop the app's Entry Point
+ * command (error 50240), which must be kept.
  */
 export async function registerAllCommands(client: Client<true>) {
   try {
-    await client.application.commands.set([]);
-    log.info("stale global commands removed");
+    const global = await client.application.commands.fetch();
+    const stale = global.filter((c) => c.type !== ApplicationCommandType.PrimaryEntryPoint);
+    for (const cmd of stale.values()) await cmd.delete();
+    log.info({ removed: [...stale.map((c) => c.name)] }, "stale global commands removed");
   } catch (err) {
     log.error({ err }, "failed to clear global commands");
   }
