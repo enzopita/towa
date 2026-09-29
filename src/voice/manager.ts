@@ -115,6 +115,14 @@ export class VoiceManager {
       adapterCreator: channel.guild.voiceAdapterCreator,
       selfDeaf: true,
       selfMute: true,
+      debug: true,
+    });
+
+    // Last handshake steps, attached to failure logs to show where the connection stalled.
+    const trail: string[] = [];
+    connection.on("debug", (msg) => {
+      trail.push(msg.slice(0, 300));
+      if (trail.length > 15) trail.shift();
     });
 
     connection.on("stateChange", (oldState, newState) => {
@@ -129,7 +137,7 @@ export class VoiceManager {
           entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
         ]);
       } catch {
-        log.warn(ctx, "voice connection lost");
+        log.warn({ ...ctx, trail }, "voice connection lost");
         connection.destroy();
         this.scheduleReconnect(guildId, "disconnected");
       }
@@ -143,7 +151,10 @@ export class VoiceManager {
         log.info(ctx, "connected to voice channel");
       })
       .catch((err) => {
-        log.warn({ ...ctx, err, timeoutMs: config.voice.connectTimeoutMs }, "failed to connect");
+        log.warn(
+          { ...ctx, err, timeoutMs: config.voice.connectTimeoutMs, status: connection.state.status, trail },
+          "failed to connect",
+        );
         connection.destroy();
         this.scheduleReconnect(guildId, "connect-timeout");
       });
