@@ -13,10 +13,18 @@ import { logger } from "../logger.ts";
 
 const log = logger.child({ module: "voice" });
 
+// Listen-only presence: never sends or receives audio.
+const VOICE_FLAGS = { selfDeaf: true, selfMute: true } as const;
+// A kick or move usually recovers on the first try, so it isn't delayed by the backoff.
+const FIRST_RETRY_MS = 1_000;
+
+type ConnectionContext = { guildId: string; guildName: string; channelId: string; channelName: string };
+
 /** Keeps the bot connected to the configured voice channel in every guild. */
 export class VoiceManager {
   private readonly pending = new Map<string, Timer>();
   private readonly attempts = new Map<string, number>();
+  private readonly trails = new WeakMap<VoiceConnection, string[]>();
   private watchdog?: Timer;
 
   constructor(private readonly client: Client) {}
@@ -43,8 +51,10 @@ export class VoiceManager {
     if (this.pending.has(guildId)) return;
     const attempt = (this.attempts.get(guildId) ?? 0) + 1;
     this.attempts.set(guildId, attempt);
-    // Exponential backoff capped at 5 min so we don't hammer the API.
-    const wait = Math.min(config.voice.reconnectDelayMs * 2 ** Math.min(attempt - 1, 6), 300_000);
+    // First retry is near-immediate (usually a kick/move); then exponential backoff
+    // capped at 5 min so a persistent failure doesn't hammer the API.
+    const backoff = config.voice.reconnectDelayMs * 2 ** Math.min(attempt - 2, 6);
+    const wait = attempt === 1 ? FIRST_RETRY_MS : Math.min(backoff, 300_000);
     log.info({ guildId, reason, attempt, delayMs: wait }, "reconnect scheduled");
     this.pending.set(
       guildId,
@@ -84,6 +94,8 @@ export class VoiceManager {
       connection?.state.status === VoiceConnectionStatus.Ready &&
       guild.members.me?.voice.channelId === cfg.channel_id
     ) {
+      // @discordjs/voice often recovers on its own before the scheduled retry runs.
+      if (this.attempts.delete(guildId)) log.info({ guildId, guildName: guild.name, reason }, "back in voice channel");
       return;
     }
 
@@ -106,20 +118,30 @@ export class VoiceManager {
 
   private connect(channel: VoiceBasedChannel): VoiceConnection {
     const guildId = channel.guild.id;
-    const ctx = { guildId, guildName: channel.guild.name, channelId: channel.id, channelName: channel.name };
-    getVoiceConnection(guildId)?.destroy();
+    const ctx: ConnectionContext = { guildId, guildName: channel.guild.name, channelId: channel.id, channelName: channel.name };
+
+    // Reuse a live connection: rejoin() moves it without leaving the channel first.
+    // Destroying it would emit a "left channel" voice state that schedules yet another reconnect.
+    const existing = getVoiceConnection(guildId);
+    if (existing && existing.state.status !== VoiceConnectionStatus.Destroyed) {
+      if (existing.rejoin({ channelId: channel.id, ...VOICE_FLAGS })) {
+        this.awaitReady(existing, ctx);
+        return existing;
+      }
+      existing.destroy();
+    }
 
     const connection = joinVoiceChannel({
       channelId: channel.id,
       guildId,
       adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: true,
-      selfMute: true,
+      ...VOICE_FLAGS,
       debug: true,
     });
 
     // Last handshake steps, attached to failure logs to show where the connection stalled.
     const trail: string[] = [];
+    this.trails.set(connection, trail);
     connection.on("debug", (msg) => {
       trail.push(msg.slice(0, 300));
       if (trail.length > 15) trail.shift();
@@ -145,6 +167,13 @@ export class VoiceManager {
 
     connection.on("error", (err) => log.error({ ...ctx, err }, "voice connection error"));
 
+    this.awaitReady(connection, ctx);
+    return connection;
+  }
+
+  private awaitReady(connection: VoiceConnection, ctx: ConnectionContext) {
+    const { guildId } = ctx;
+    const trail = this.trails.get(connection);
     entersState(connection, VoiceConnectionStatus.Ready, config.voice.connectTimeoutMs)
       .then(() => {
         this.attempts.delete(guildId);
@@ -158,7 +187,5 @@ export class VoiceManager {
         connection.destroy();
         this.scheduleReconnect(guildId, "connect-timeout");
       });
-
-    return connection;
   }
 }
